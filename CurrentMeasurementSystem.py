@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[ ]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QApplication, QVBoxLayout, QWidget, QLabel
@@ -51,7 +51,7 @@ class ArduinoData:
         if self.ser and self.ser.isOpen():  # Check if the serial object exists and if the port is open
             self.ser.close()  # Close the current connection
         if new_com_port:  # Only create a serial connection if a valid COM port is given
-            self.ser = serial.Serial(new_com_port, self.baud_rate, timeout=1)
+            self.ser = serial.Serial(new_com_port, 115200, timeout=1)
         else:
             #self.raw_data_view.append('Error: Serial connection is not open')
             print("No COM port selected")  # Print a message if no valid COM port is given
@@ -80,7 +80,7 @@ class ArduinoData:
         return self.ser is not None and self.ser.isOpen()
 
 
-# In[2]:
+# In[ ]:
 
 
 from queue import Queue
@@ -103,6 +103,8 @@ class DataAcquisitionThread(QThread):
             current, voltage = self.read_data()
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # Get the current time with milliseconds
             if current is not None and voltage is not None:
+                current = round(current, 2)
+                voltage = round(voltage, 2)
                 self.data_queue.put((timestamp, current, voltage))
 
     def stop(self):
@@ -155,7 +157,7 @@ class DataAcquisitionThread(QThread):
             return None, None
 
 
-# In[3]:
+# In[ ]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QVBoxLayout, QWidget, QScrollBar
@@ -341,7 +343,7 @@ class GraphWindow(QMainWindow):
             self.other.graphWidget.setXRange(value, value + self.other.app_window.zoom_level_x)
 
 
-# In[4]:
+# In[ ]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QApplication, QVBoxLayout, QWidget, QPushButton, QSlider, QMessageBox, QTextEdit, QFileDialog, QComboBox, QLineEdit, QCheckBox, QHBoxLayout, QGroupBox, QDesktopWidget, QDialog
@@ -387,6 +389,8 @@ class AppWindow(QMainWindow):
         self.update_graph_time = 50 #time in which graph updates (ms)
         self.selected_baud_rate = 115200
         self.view_type = True
+        self.file_count = 1
+        self.rows_logged = 0
 
         self.raw_data_view = QTextEdit()
         # Add a QTextEdit widget for the data field
@@ -859,7 +863,7 @@ class AppWindow(QMainWindow):
             self.backup_file_name = f'CMS_{timestamp}_backup_SR_{self.sample_rate}.csv'
             with open(self.backup_file_name, 'w', newline='') as f:
                 log_writer = csv.writer(f)
-                log_writer.writerow(['Sample Rate: ' + str(self.sample_rate), 'Date and Time: ' + datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                log_writer.writerow(['Sample Rate: ' + str(self.sample_rate), 'Date and Time: ' + datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'File Count: ' + str(self.file_count)])
                 log_writer.writerow(['Timestamp','Current', 'Voltage'])
 
     def start_live_data_collection(self):
@@ -930,9 +934,17 @@ class AppWindow(QMainWindow):
                     self.raw_data_view.clear()
                 
                 if self.backup_file_name:   # If logging has started, write to the log
-                    with open(self.backup_file_name, 'a', newline='') as f:
-                        log_writer = csv.writer(f)
-                        log_writer.writerow([timestamp, current, voltage])
+                    if self.rows_logged < 1048570:   # You can use a little less than 1,048,576 to account for headers and other potential rows
+                        with open(self.backup_file_name, 'a', newline='') as f:
+
+                            log_writer = csv.writer(f)
+                            log_writer.writerow([timestamp, current, voltage])
+                            self.rows_logged += 1                            
+                    else:
+                        self.rows_logged = 0
+                        self.backup_file_name = None
+                        self.start_logging()
+                        self.file_count += 1
 
                 if self.view_type:
                     if len(self.x) > self.resetarray:
@@ -962,42 +974,65 @@ class AppWindow(QMainWindow):
     def load_data(self):
         options = QFileDialog.Options()
         options |= QFileDialog.ReadOnly
-        fileName, _ = QFileDialog.getOpenFileName(self, "Load Data", "", "CSV Files (*.csv);;All Files (*)", options=options)
-        if fileName:
+        fileNames, _ = QFileDialog.getOpenFileNames(self, "Load Data", "", "CSV Files (*.csv);;All Files (*)", options=options)
+
+        # Create a dictionary to store file counts
+        file_counts = {}
+
+        # Extract file count from each file and store in the dictionary
+        for fileName in fileNames:
             with open(fileName, 'r') as f:
                 reader = csv.reader(f)
+                header1 = next(reader)
+                file_count_str = [entry for entry in header1 if "File Count:" in entry][0]
+                file_count_val = int(file_count_str.split(':')[1].strip())
+                file_counts[fileName] = file_count_val
 
-                # Read and process the first row for sample rate
-                header1 = next(reader)  
-                sample_rate_str = header1[0]  
-                sample_rate_val = sample_rate_str.split(':')[1].strip()
-                sample_rate = int(sample_rate_val)
+        # Sort fileNames based on the file count
+        sorted_fileNames = sorted(file_counts, key=file_counts.get)
 
-                # Skip the second row (column headers)
-                next(reader)  
+        all_y_current = []
+        all_y_voltage = []
 
-                # Read the remaining rows into lists (taking care to ignore the timestamp column)
-                y_current = []
-                y_voltage = []
-                for row in reader:
-                    y_current.append(float(row[1]))  # row[0] is timestamp, which we ignore
-                    y_voltage.append(float(row[2]))
+        for fileName in sorted_fileNames:
+            if fileName:
+                with open(fileName, 'r') as f:
+                    reader = csv.reader(f)
 
-            # Convert lists to numpy arrays
-            y_current = np.array(y_current)
-            y_voltage = np.array(y_voltage)
+                    # Read and process the first row for sample rate
+                    header1 = next(reader)  
+                    sample_rate_str = header1[0]  
+                    sample_rate_val = sample_rate_str.split(':')[1].strip()
+                    sample_rate = int(sample_rate_val)
 
-            # Calculate the time values based on the sample rate
-            x = np.arange(0, len(y_current)) * (sample_rate / 1000)  # convert sample rate from ms to s
+                    # Skip the second row (column headers)
+                    next(reader)  
 
-            # Check if graph windows are open, if not, open them
-            if self.graphWindow1 is None or not self.graphWindow1.isVisible():
-                self.graphWindow1.show()
-            if self.graphWindow2 is None or not self.graphWindow2.isVisible():
-                self.graphWindow2.show()
+                    # Read the remaining rows into lists
+                    y_current = []
+                    y_voltage = []
+                    for row in reader:
+                        y_current.append(float(row[1]))  # row[0] is timestamp, which we ignore
+                        y_voltage.append(float(row[2]))
 
-            self.graphWindow1.update_plot_data(x, y_current)
-            self.graphWindow2.update_plot_data(x, y_voltage)
+                    all_y_current.extend(y_current)
+                    all_y_voltage.extend(y_voltage)
+
+        # Convert lists to numpy arrays
+        all_y_current = np.array(all_y_current)
+        all_y_voltage = np.array(all_y_voltage)
+
+        # Calculate the time values based on the sample rate
+        x = np.arange(0, len(all_y_current)) * (sample_rate / 1000)  # convert sample rate from ms to s
+
+        # Check if graph windows are open, if not, open them
+        if self.graphWindow1 is None or not self.graphWindow1.isVisible():
+            self.graphWindow1.show()
+        if self.graphWindow2 is None or not self.graphWindow2.isVisible():
+            self.graphWindow2.show()
+
+        self.graphWindow1.update_plot_data(x, all_y_current)
+        self.graphWindow2.update_plot_data(x, all_y_voltage)
             
     def set_sample_rate(self):
         self.sample_rate_button_clicks += 1
@@ -1182,7 +1217,7 @@ class AppWindow(QMainWindow):
         event.accept()  # This line is necessary to ensure the window actually closes
 
 
-# In[5]:
+# In[ ]:
 
 
 def main():
