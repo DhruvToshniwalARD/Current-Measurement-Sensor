@@ -13,6 +13,7 @@ import serial
 import time
 import numpy as np
 from serial.tools import list_ports
+import struct
 
 #Handles serial communication with Arduino circuit
 class ArduinoData:
@@ -34,20 +35,6 @@ class ArduinoData:
         self.baud_rate = baud_rate  # Store the baudrate
         time.sleep(2)
         
-        #data is sent as a float tuple (float current, float voltage)
-    def read_data(self):
-        try:
-            if self.ser:
-                line = self.ser.readline().decode('utf-8').strip()  # Read a line of data
-                if line:  # Check that the line is not empty
-                    current_str, voltage_str = line.split(",")  # Split the line at the comma
-                    current = float(current_str)  # Convert the current string to a float
-                    voltage = float(voltage_str)  # Convert the voltage string to a float
-                    return current, voltage
-            return None, None
-        except Exception as e:
-            return None, None
-
         #send data to arduino board
     def send_data(self, data):
         if self.ser is not None and self.ser.isOpen():
@@ -94,6 +81,81 @@ class ArduinoData:
 
 
 # In[2]:
+
+
+from queue import Queue
+from PyQt5.QtCore import QThread
+import time
+import struct
+from datetime import datetime
+
+class DataAcquisitionThread(QThread):
+    def __init__(self, arduino, data_queue):
+        super(DataAcquisitionThread, self).__init__()
+        self.arduino = arduino
+        self.data_queue = data_queue
+        self.is_running = True
+        self.ser = self.arduino.ser  # Assuming the arduino object has a 'ser' attribute
+        self.last_error_time = 0  # Track when we last printed an error
+
+    def run(self):
+        while self.is_running:
+            current, voltage = self.read_data()
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # Get the current time with milliseconds
+            if current is not None and voltage is not None:
+                self.data_queue.put((timestamp, current, voltage))
+
+    def stop(self):
+        self.is_running = False
+
+    def read_data(self):
+        HEADER = b'\xAA\xAA'
+        DATA_FORMAT = 'ff'  # Two floats
+        DATA_SIZE = struct.calcsize(DATA_FORMAT)  # Calculate the size based on format
+
+        try:
+            if not self.ser.isOpen():
+                current_time = time.time()
+                # Print error message at most every 10 seconds
+                if current_time - self.last_error_time > 10:
+                    print("Serial port is not open.")
+                    self.last_error_time = current_time
+                return None, None
+
+            # Continuously read bytes looking for the header
+            while True:
+                # Read a single byte
+                byte = self.ser.read(1)
+
+                # If the byte matches the first byte of the header
+                if byte == HEADER[0:1]:
+                    # Check if the next byte matches the second byte of the header
+                    if self.ser.read(1) == HEADER[1:2]:
+                        # If both match, break out of the loop to process data
+                        break
+
+            # At this point, the header has been found.
+            # Read the subsequent bytes for the actual data
+            data_bytes = self.ser.read(DATA_SIZE)
+
+            # Check for data integrity
+            if len(data_bytes) != DATA_SIZE:
+                return None, None
+
+            # Unpack the data using struct
+            current, voltage = struct.unpack(DATA_FORMAT, data_bytes)
+            return current, voltage
+
+        except Exception as e:
+            current_time = time.time()
+            # Print error message at most every 10 seconds
+            if current_time - self.last_error_time > 10:
+                print(f"Error while reading data: {e}")
+                self.last_error_time = current_time
+            return None, None
+
+
+# In[3]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QVBoxLayout, QWidget, QScrollBar
@@ -237,7 +299,8 @@ class GraphWindow(QMainWindow):
                 self.vLine.setPos(mousePoint.x())
                 if not np.isnan(mousePoint.x()):
                     mouse_x = mousePoint.x()
-                    index = (np.abs(self.x - mouse_x)).argmin()
+                    x_array = np.array(self.x)  # Convert list to numpy array
+                    index = (np.abs(x_array - mouse_x)).argmin()
                     if 0 <= index < len(self.x):
                         # Add a semi-transparent background to the label
                         self.y_value_text.setHtml(f'<span style="color: white; background-color: rgba(0, 0, 0, 0.5)">{self.y_label}:{self.y[index]:.2f}</span>')  # Update this graph's y value
@@ -256,13 +319,8 @@ class GraphWindow(QMainWindow):
                             
                             self.other.vLine.setPos(mousePoint.x())  # This moves the line in the other graph
         except IndexError as e:
-            print(f"IndexError occurred: {e}")
-            print(f"mousePoint.x() = {mousePoint.x()}")
-            print(f"len(self.x) = {len(self.x)}")
-            print(f"len(self.y) = {len(self.y)}")
-            if self.other:
-                print(f"len(self.other.y) = {len(self.other.y)}")
-
+            print("Error in mouseMoved")
+            
     def update_plot_data(self, x, y):
         self.data_line.setData(x, y)
         self.x = x
@@ -283,7 +341,7 @@ class GraphWindow(QMainWindow):
             self.other.graphWidget.setXRange(value, value + self.other.app_window.zoom_level_x)
 
 
-# In[3]:
+# In[4]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QApplication, QVBoxLayout, QWidget, QPushButton, QSlider, QMessageBox, QTextEdit, QFileDialog, QComboBox, QLineEdit, QCheckBox, QHBoxLayout, QGroupBox, QDesktopWidget, QDialog
@@ -298,6 +356,7 @@ from datetime import datetime
 import json
 import os
 import shutil
+from queue import Queue, Empty
 
 class AppWindow(QMainWindow):
     def __init__(self, arduino, *args, **kwargs):
@@ -311,21 +370,32 @@ class AppWindow(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.central_widget.setLayout(self.layout)
-        self.zoom_level_x = 100  # A zoom level variable is initialized
-        self.zoom_level_y_current = 10
+        self.zoom_level_x = 100
+        self.zoom_level_y_current = 100
         self.zoom_level_y_voltage = 5000
         self.sample_rate = None
         self.live_data_paused = False
         self.sample_rate_button_clicks = 1    
         self.log_file = None
         self.log_writer = None
-        self.logging = False  # add this line
+        self.logging = False
         self.backup_file_name = None
-      
+        self.resetarray = 10000
+        self.resetrawdata = 10000
+        self.rawdatacounter = 0
+        self.can_update_plot = False  # This flag indicates if the plot can be updated
+        self.update_graph_time = 50 #time in which graph updates (ms)
+        self.selected_baud_rate = 115200
+        self.view_type = True
+
         self.raw_data_view = QTextEdit()
         # Add a QTextEdit widget for the data field
         self.data_field = QTextEdit()
         #self.layout.addWidget(self.data_field)
+        
+        self.plot_timer = QTimer()
+        self.plot_timer.timeout.connect(self.set_update_flag)
+        self.plot_timer.start(self.update_graph_time)
         
         # Different buttons, fields, sliders and checkboxes are created and added to the layout
         self.save_battery_data_button = QPushButton('Save Battery Data')
@@ -367,10 +437,21 @@ class AppWindow(QMainWindow):
         self.acquire_stop_button.setStyleSheet("background-color: lightpink")
         self.acquire_stop_button.clicked.connect(self.stop_data_collection)
 
+        self.load_all = QPushButton('Load All')
+        self.load_all.setStyleSheet("background-color: lightpink")
+        self.load_all.clicked.connect(self.set_load_all)
+        self.load_all.setEnabled(False)
+        
+        self.liveview = QPushButton('Live View')
+        self.liveview.setStyleSheet("background-color: lightpink")
+        self.liveview.clicked.connect(self.set_live_view)
+        self.liveview.setEnabled(False)
+
         # Live data layout
         self.pause_button = QPushButton('Pause Display')
         self.pause_button.setStyleSheet("background-color: lightpink")
         self.pause_button.clicked.connect(self.toggle_live_data)
+        self.pause_button.setEnabled(False)
         
         #Clear and sync data layout
         self.clear_button = QPushButton('Clear Data')
@@ -380,6 +461,7 @@ class AppWindow(QMainWindow):
         self.sync_button = QPushButton('Sync Graphs')
         self.sync_button.setStyleSheet("background-color: lightpink")
         self.sync_button.clicked.connect(self.sync_graphs)
+        self.sync_button.setEnabled(False)
 
         self.data_control = QVBoxLayout()
         self.data_acquire = QHBoxLayout()
@@ -388,6 +470,8 @@ class AppWindow(QMainWindow):
 
         self.data_acquire.addWidget(self.acquire_start_button)
         self.data_acquire.addWidget(self.acquire_stop_button)
+        self.live_data.addWidget(self.load_all)
+        self.live_data.addWidget(self.liveview)
         self.live_data.addWidget(self.pause_button)
         self.clear_and_sync.addWidget(self.clear_button)
         self.clear_and_sync.addWidget(self.sync_button)
@@ -399,12 +483,13 @@ class AppWindow(QMainWindow):
         self.data_group.setLayout(self.data_control)  # Set the group layout to the parent layout
         self.layout.addWidget(self.data_group)  # Add the group
 
-        self.save_datas = QPushButton('Save Data')
+        self.save_datas = QPushButton('Save Data As')
         self.save_datas.setStyleSheet("background-color: lightgreen")
         self.save_datas.clicked.connect(self.save_data)
         self.save_image_button = QPushButton('Save Image')
         self.save_image_button.setStyleSheet("background-color: lightgreen")
         self.save_image_button.clicked.connect(self.save_image)
+        self.save_image_button.setEnabled(False)
 
         self.save_raw_data_button = QPushButton('Save Log Data')
         self.save_raw_data_button.setStyleSheet("background-color: lightgreen")
@@ -481,7 +566,11 @@ class AppWindow(QMainWindow):
         # Add the exit button
         self.exit_button = QPushButton('Exit')
         self.exit_button.setStyleSheet("background-color: lightcoral")
-        self.exit_button.clicked.connect(self.close_application)        
+        self.exit_button.clicked.connect(self.close_application)  
+        
+        self.showlog = QCheckBox('Show Log', self)  # create a checkbox
+        self.showlog.setChecked(True)  # set default state
+        self.layout.addWidget(self.showlog)
         self.layout.addWidget(self.raw_data_view)
         
         # Similarly, create a horizontal layout for the connect and refresh connection buttons
@@ -512,17 +601,8 @@ class AppWindow(QMainWindow):
         self.com_layout.addWidget(self.com_label)
         self.com_layout.addWidget(self.com_combo)
 
-        # Layout for Baud rate
-        self.baud_layout = QHBoxLayout()
-        self.baud_label = QLabel('Baud Rate:')
-        self.baud_combo = QComboBox()
-        self.baud_combo.addItems(['9600', '14400', '19200', '38400', '57600', '115200'])
-        self.baud_combo.currentIndexChanged.connect(self.update_baud_rate)
-        self.baud_layout.addWidget(self.baud_label)
-        self.baud_layout.addWidget(self.baud_combo)
-
         self.connection_layout.addLayout(self.com_layout)  # Add the com layout to the group layout
-        self.connection_layout.addLayout(self.baud_layout)  # Add the baud layout to the group layout
+        #self.connection_layout.addLayout(self.baud_layout)  # Add the baud layout to the group layout
         self.connection_layout.addLayout(self.connect_refresh_layout)  # Add the connect/refresh layout to the group layout
         self.connection_group.setLayout(self.connection_layout)  # Set the group layout
         self.layout.addWidget(self.connection_group)  # Add the group
@@ -611,7 +691,6 @@ class AppWindow(QMainWindow):
                 "sample_rate": self.sample_rate_field.text(),
                 "sample_rate_units": self.sample_rate_units_combo.currentText(),
                 "com_port": self.com_combo.currentText(),
-                "baud_rate": self.baud_combo.currentText()
             }
             with open(fileName, 'w') as json_file:
                 json.dump(config, json_file)
@@ -636,7 +715,6 @@ class AppWindow(QMainWindow):
                 self.sample_rate_field.setText(config["sample_rate"])
                 self.sample_rate_units_combo.setCurrentText(config["sample_rate_units"])
                 self.com_combo.setCurrentText(config["com_port"])
-                self.baud_combo.setCurrentText(config["baud_rate"])
                 self.connect_to_arduino()
                 self.set_sample_rate()
 
@@ -647,15 +725,80 @@ class AppWindow(QMainWindow):
 
     def connect_to_arduino(self):
         selected_com_port = self.com_combo.currentText()
-        selected_baud_rate = int(self.baud_combo.currentText())
         try:
-            self.arduino.connect(selected_com_port, selected_baud_rate)
-            self.raw_data_view.append(f'Connected to {selected_com_port} at {selected_baud_rate} baud rate.')
+            self.arduino.update_baud_rate(self.selected_baud_rate)
+            self.arduino.connect(selected_com_port, self.selected_baud_rate)
+            self.raw_data_view.append(f'Connected to {selected_com_port} at {self.selected_baud_rate} baud rate.')
             self.connect_button.setText("Disconnect")  # Change the button text
         except serial.SerialException as e:
             self.raw_data_view.append(f'Error connecting to the Current Sensor: {str(e)}')
         except Exception as e:
-            self.raw_data_view.append(str(e))         
+            self.raw_data_view.append(str(e))    
+            
+    def set_load_all(self):
+        # Check if self.backup_file_name has been set
+        if not self.backup_file_name:
+            QMessageBox.warning(self, "No Data", "No backup data has been logged yet.")
+            return
+
+        # Set view_type to False for loading all
+        self.view_type = False
+        self.load_all.setText("Reload")
+
+        # Optional: Change button colors
+        self.load_all.setStyleSheet("background-color: lightgreen")
+        self.liveview.setStyleSheet("background-color: lightpink")
+
+        # Read and process the backup file
+        with open(self.backup_file_name, 'r') as f:
+            reader = csv.reader(f)
+
+            # Read and process the first row for sample rate
+            header1 = next(reader)
+            sample_rate_str = header1[0]
+            sample_rate_val = sample_rate_str.split(':')[1].strip()
+            sample_rate = int(sample_rate_val)
+
+            # Skip the second row (column headers)
+            next(reader)
+
+            # Read the remaining rows into lists (ignoring the timestamp column)
+            y_current = []
+            y_voltage = []
+            for row in reader:
+                y_current.append(float(row[1]))
+                y_voltage.append(float(row[2]))
+
+        # Convert lists to numpy arrays
+        y_current = np.array(y_current)
+        y_voltage = np.array(y_voltage)
+
+        # Calculate the time values based on the sample rate
+        x = np.arange(0, len(y_current)) * (sample_rate / 1000)  # convert sample rate from ms to s
+
+        # Check if graph windows are open, if not, open them
+        if self.graphWindow1 is None or not self.graphWindow1.isVisible():
+            self.graphWindow1.show()
+        if self.graphWindow2 is None or not self.graphWindow2.isVisible():
+            self.graphWindow2.show()
+
+        min_x = np.min(x)
+        max_x = np.max(x)
+        
+        self.graphWindow1.graphWidget.setXRange(min_x, max_x)
+        self.graphWindow2.graphWidget.setXRange(min_x, max_x)
+        
+        self.graphWindow1.update_plot_data(x, y_current)
+        self.graphWindow2.update_plot_data(x, y_voltage)
+
+    def set_live_view(self):
+        # Set view_type to True for live view
+        self.view_type = True
+
+        # Optional: Change button colors
+        self.load_all.setStyleSheet("background-color: lightpink")
+        self.liveview.setStyleSheet("background-color: lightgreen")
+        self.load_all.setText("Load All")
             
     def toggle_live_data(self):
         if self.live_data_paused:
@@ -691,18 +834,33 @@ class AppWindow(QMainWindow):
                 self.graphWindow1.show()
                 self.graphWindow2.show()
                 self.start_logging()
+                
                 self.sample_rate_button.setEnabled(False)  # Disable the "Set Sample Rate" button
+                self.liveview.setEnabled(True)
+                self.load_all.setEnabled(True)
+                self.save_image_button.setEnabled(True)
+                self.pause_button.setEnabled(True)
+                self.sync_button.setEnabled(True)
+                self.liveview.setStyleSheet("background-color: lightgreen")
+                
+                # Initialize a queue for data communication
+                self.data_queue = Queue()
+
+                # Start the data acquisition thread
+                self.data_thread = DataAcquisitionThread(self.arduino, self.data_queue)
+                self.data_thread.start()
+                self.zoom_level_x = self.sample_rate * 10  # A zoom level variable is initialized
         else:
             self.raw_data_view.append("Current Sensor is not connected.")
             
     def start_logging(self):
         if not self.backup_file_name:
             timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-            self.backup_file_name = f'CMS_{timestamp}_backup.csv'
+            self.backup_file_name = f'CMS_{timestamp}_backup_SR_{self.sample_rate}.csv'
             with open(self.backup_file_name, 'w', newline='') as f:
                 log_writer = csv.writer(f)
                 log_writer.writerow(['Sample Rate: ' + str(self.sample_rate), 'Date and Time: ' + datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-                log_writer.writerow(['Current', 'Voltage'])
+                log_writer.writerow(['Timestamp','Current', 'Voltage'])
 
     def start_live_data_collection(self):
         self.arduino.clear_buffer()
@@ -727,24 +885,61 @@ class AppWindow(QMainWindow):
             shutil.copyfile(self.backup_file_name, backup_file_path)
 
     def stop_data_collection(self):
+        # Send Stop command to Arduino
         self.arduino.send_data("Stop")
+
+        # Stop the timer
         self.timer.stop()
+
+        # Stop the data acquisition thread if it exists and is running
+        if hasattr(self, 'data_thread') and self.data_thread.isRunning():
+            self.data_thread.is_running = False
+            self.data_thread.terminate()
+            self.data_thread.wait()
+
+        # Clear the Arduino buffer
         self.arduino.clear_buffer()
-        self.sample_rate_button.setEnabled(True)  # Disable the "Set Sample Rate" button
+
+        # Update the GUI elements
+        self.sample_rate_button.setEnabled(True)
+        self.liveview.setEnabled(False)
+        self.load_all.setEnabled(False)
+        self.pause_button.setEnabled(False)
 
     def update(self):
         try:
-            data = self.arduino.read_data()  # Using the instance variable
-            current, voltage = data
+            # Try to get data from the queue, if available
+            try:
+                timestamp, current, voltage = self.data_queue.get_nowait()
+            except Empty:
+                return
             if current is not None and voltage is not None:
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # get the current time with milliseconds
-                self.update_plot_data('current', current)
-                self.update_plot_data('voltage', voltage)
-                self.raw_data_view.append(f'{timestamp} - I: {current} - V: {voltage}')  # Update the raw data view
+                self.update_plot_data({
+                    'current': current,
+                    'voltage': voltage
+                })
+                
+                if self.showlog.isChecked():
+                    self.rawdatacounter += 1  # Increment the counter
+                    if self.rawdatacounter >= 10000:  # Check if the counter has reached or exceeded 10000
+                        self.rawdatacounter = 0  # Reset the counter
+                        self.raw_data_view.clear()  # Clear the raw data view
+                    else:
+                        self.raw_data_view.append(f'{timestamp} - I: {current} - V: {voltage}')  # Update the raw data view
+                else:
+                    self.raw_data_view.clear()
+                
                 if self.backup_file_name:   # If logging has started, write to the log
                     with open(self.backup_file_name, 'a', newline='') as f:
                         log_writer = csv.writer(f)
-                        log_writer.writerow([current, voltage])
+                        log_writer.writerow([timestamp, current, voltage])
+
+                if self.view_type:
+                    if len(self.x) > self.resetarray:
+                        self.x = self.x[-self.resetarray:]
+                        self.y_current = self.y_current[-self.resetarray:]
+                        self.y_voltage = self.y_voltage[-self.resetarray:]
+
         except Exception as e:
             print(f"Error in update: {e}")
 
@@ -760,6 +955,9 @@ class AppWindow(QMainWindow):
         # Set the x-axes of both graphs to the intersection
         self.graphWindow1.graphWidget.setXRange(min_x, max_x)
         self.graphWindow2.graphWidget.setXRange(min_x, max_x)
+        
+    def set_update_flag(self):
+        self.can_update_plot = True
 
     def load_data(self):
         options = QFileDialog.Options()
@@ -768,34 +966,38 @@ class AppWindow(QMainWindow):
         if fileName:
             with open(fileName, 'r') as f:
                 reader = csv.reader(f)
-                header1 = next(reader)  # read the first row
-                sample_rate_str = header1[0]  # sample rate is in the first column
-                sample_rate_val = sample_rate_str.split(':')[1].strip()  # split the string and take the second part
-                self.sample_rate = int(sample_rate_val)  # update the sample_rate value
-                next(reader)  # skip the second row (headers)
 
-                # read the remaining rows into lists
-                self.y_current = []
-                self.y_voltage = []
+                # Read and process the first row for sample rate
+                header1 = next(reader)  
+                sample_rate_str = header1[0]  
+                sample_rate_val = sample_rate_str.split(':')[1].strip()
+                sample_rate = int(sample_rate_val)
+
+                # Skip the second row (column headers)
+                next(reader)  
+
+                # Read the remaining rows into lists (taking care to ignore the timestamp column)
+                y_current = []
+                y_voltage = []
                 for row in reader:
-                    self.y_current.append(float(row[0]))
-                    self.y_voltage.append(float(row[1]))
+                    y_current.append(float(row[1]))  # row[0] is timestamp, which we ignore
+                    y_voltage.append(float(row[2]))
 
-            # convert lists to numpy arrays
-            self.y_current = np.array(self.y_current)
-            self.y_voltage = np.array(self.y_voltage)
+            # Convert lists to numpy arrays
+            y_current = np.array(y_current)
+            y_voltage = np.array(y_voltage)
 
-            # calculate the time values based on the sample rate
-            self.x = np.arange(0, len(self.y_current)) * (self.sample_rate / 2000)  # convert sample rate from ms to s and divide by 2
+            # Calculate the time values based on the sample rate
+            x = np.arange(0, len(y_current)) * (sample_rate / 1000)  # convert sample rate from ms to s
 
-            # check if graph windows are open, if not, open them
+            # Check if graph windows are open, if not, open them
             if self.graphWindow1 is None or not self.graphWindow1.isVisible():
                 self.graphWindow1.show()
             if self.graphWindow2 is None or not self.graphWindow2.isVisible():
                 self.graphWindow2.show()
 
-            self.graphWindow1.update_plot_data(self.x, self.y_current)
-            self.graphWindow2.update_plot_data(self.x, self.y_voltage)
+            self.graphWindow1.update_plot_data(x, y_current)
+            self.graphWindow2.update_plot_data(x, y_voltage)
             
     def set_sample_rate(self):
         self.sample_rate_button_clicks += 1
@@ -821,44 +1023,37 @@ class AppWindow(QMainWindow):
             if sample_rate_units == 's':
                 sample_rate_value *= 1000  # convert to ms
             self.sample_rate = sample_rate_value
-            self.raw_data_view.append('Sample rate set')
-
+            self.raw_data_view.append(f'Sample rate set to: {self.sample_rate} ms.')
+            self.backup_file_name = None
+            self.x = []
+            self.y_voltage = []
+            self.y_current = []
             self.arduino.send_data('s' + str(sample_rate_value))
         else:
-            self.raw_data_view.append('Current Sensor is not connected')
+            self.raw_data_view.append('Current Sensor is not connected.')
 
-    def update_plot_data(self, data_type, data_val):
+    def update_plot_data(self, data):
         try:
             if not self.sample_rate:  # If the sample rate is not set, return
                 return
-            sample_rate_s = self.sample_rate / 2000  # Convert sample rate from ms to s and divide by 2
+
+            sample_rate_s = self.sample_rate / 1000  # Convert sample rate from ms to s
             time_value = (self.x[-1] + sample_rate_s) if len(self.x) > 0 else 0
-            self.x = np.append(self.x, time_value)
+            self.x.append(time_value)
 
-            if data_type == 'current':
-                self.y_current = np.append(self.y_current, data_val)
-                self.y_voltage = np.append(self.y_voltage, np.nan)  # append np.nan to keep the same length as self.x
-            elif data_type == 'voltage':
-                self.y_voltage = np.append(self.y_voltage, data_val)
-                self.y_current = np.append(self.y_current, np.nan)  # append np.nan to keep the same length as self.x
+            self.y_current.append(data.get('current', np.nan))
+            self.y_voltage.append(data.get('voltage', np.nan))
 
-            # Interpolate missing data
-            valid_current_indices = [i for i, y in enumerate(self.y_current) if np.isfinite(y)]
-            valid_voltage_indices = [i for i, y in enumerate(self.y_voltage) if np.isfinite(y)]
-            if valid_current_indices:
-                self.y_current = np.interp(self.x, [self.x[i] for i in valid_current_indices], [self.y_current[i] for i in valid_current_indices])
-            if valid_voltage_indices:
-                self.y_voltage = np.interp(self.x, [self.x[i] for i in valid_voltage_indices], [self.y_voltage[i] for i in valid_voltage_indices])
-
-            if not self.live_data_paused:  # If live data is not paused, update the plot
+            if self.can_update_plot and not self.live_data_paused and self.view_type:
                 self.graphWindow1.update_plot_data(self.x, self.y_current)
                 self.graphWindow2.update_plot_data(self.x, self.y_voltage)
 
-                # Dynamic adjustment of x-axis range based on latest data points
-                min_x = self.x[-1] - self.zoom_level_x
-                max_x = self.x[-1]
+                min_x = self.x[-1] - self.zoom_level_x if self.x else 0
+                max_x = self.x[-1] if self.x else 0
                 self.graphWindow1.graphWidget.setXRange(min_x, max_x)
                 self.graphWindow2.graphWidget.setXRange(min_x, max_x)
+
+                self.can_update_plot = False  # Reset the flag
 
         except IndexError:
             pass
@@ -966,17 +1161,17 @@ class AppWindow(QMainWindow):
         selected_com_port = self.com_combo.currentText()
         print(f"Selected COM port: {selected_com_port}")
         self.arduino.update_com_port(selected_com_port)
-     
-    def update_baud_rate(self):
-        selected_baud_rate = int(self.baud_combo.currentText())
-        self.arduino.update_baud_rate(selected_baud_rate)
         
     def close_application(self):
         reply = QMessageBox.question(self, 'Exit Confirmation',
                                      'Are you sure you want to exit?', QMessageBox.Yes |
                                      QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
-            #self.save_backup()
+            if hasattr(self, 'data_thread') and self.data_thread.isRunning():
+                self.data_thread.is_running = False
+                self.data_thread.terminate()
+                self.data_thread.wait()
+
             self.arduino.close()  # Close the serial port
             QApplication.quit()  # Close the application
         else:
@@ -987,7 +1182,7 @@ class AppWindow(QMainWindow):
         event.accept()  # This line is necessary to ensure the window actually closes
 
 
-# In[4]:
+# In[5]:
 
 
 def main():
@@ -999,4 +1194,10 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# In[ ]:
+
+
+
 
