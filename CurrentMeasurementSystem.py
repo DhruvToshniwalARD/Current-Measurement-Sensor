@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# In[1]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QApplication, QVBoxLayout, QWidget, QLabel
@@ -80,7 +80,7 @@ class ArduinoData:
         return self.ser is not None and self.ser.isOpen()
 
 
-# In[ ]:
+# In[2]:
 
 
 from queue import Queue
@@ -157,7 +157,7 @@ class DataAcquisitionThread(QThread):
             return None, None
 
 
-# In[ ]:
+# In[3]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QVBoxLayout, QWidget, QScrollBar
@@ -343,7 +343,7 @@ class GraphWindow(QMainWindow):
             self.other.graphWidget.setXRange(value, value + self.other.app_window.zoom_level_x)
 
 
-# In[ ]:
+# In[4]:
 
 
 from PyQt5.QtWidgets import QMainWindow, QApplication, QVBoxLayout, QWidget, QPushButton, QSlider, QMessageBox, QTextEdit, QFileDialog, QComboBox, QLineEdit, QCheckBox, QHBoxLayout, QGroupBox, QDesktopWidget, QDialog
@@ -943,8 +943,8 @@ class AppWindow(QMainWindow):
                     else:
                         self.rows_logged = 0
                         self.backup_file_name = None
-                        self.start_logging()
                         self.file_count += 1
+                        self.start_logging()
 
                 if self.view_type:
                     if len(self.x) > self.resetarray:
@@ -1217,7 +1217,7 @@ class AppWindow(QMainWindow):
         event.accept()  # This line is necessary to ensure the window actually closes
 
 
-# In[ ]:
+# In[5]:
 
 
 def main():
@@ -1229,10 +1229,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-# In[ ]:
-
-
-
 
